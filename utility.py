@@ -130,7 +130,7 @@ class RandomErasing3(object):
         
 
 def scheduler(optimizer):
-    num_epochs = args.epochs
+    num_epochs = 120
     
     lr_min = 0.002 * 0.008
     warmup_lr_init = 0.01 * 0.008
