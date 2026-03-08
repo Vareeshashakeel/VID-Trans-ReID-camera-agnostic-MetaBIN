@@ -11,13 +11,11 @@ from Datasets.MARS_dataset import Mars
 from Datasets.iLDSVID import iLIDSVID
 from Datasets.PRID_dataset import PRID
 
-
 __factory = {
     'Mars': Mars,
     'iLIDSVID': iLIDSVID,
     'PRID': PRID,
 }
-
 
 # ---------------------------------------------------------
 # Collate functions
@@ -28,7 +26,7 @@ def train_collate_fn(batch):
     Returns:
         imgs: [B, T, C, H, W]
         pids: [B]
-        camids: [B]   (NOT used by model)
+        camids: [B]   (returned for protocol only; model may ignore)
         erase_mask: [B, T]
     """
     imgs, pids, camids, erase_mask = zip(*batch)
@@ -43,7 +41,7 @@ def train_collate_fn(batch):
 def val_collate_fn(batch):
     """
     Returns:
-        imgs: [B, N, T, C, H, W]  (B=1 during eval)
+        imgs: [B, K, T, C, H, W]  (B=1 during eval)
         pids: list[int]
         camids: [B]
         img_paths: list
@@ -71,7 +69,7 @@ def dataloader(
 ):
     """
     Camera-agnostic dataloader.
-    camids are returned ONLY for evaluation protocol.
+    camids are returned for evaluation protocol (filter same id+cam).
     """
 
     train_transforms = T.Compose([
@@ -95,6 +93,7 @@ def dataloader(
         dataset.train,
         seq_len=seq_len,
         transform=train_transforms,
+        sample="intelligent",     # ✅ matches base behavior
     )
 
     train_loader = DataLoader(
@@ -166,23 +165,45 @@ def read_image(img_path):
 
 class VideoDatasetTrain(Dataset):
     """
-    Training dataset with random erasing
+    Training dataset with random erasing + "intelligent" sampling
     """
 
-    def __init__(self, dataset, seq_len, transform=None):
+    def __init__(self, dataset, seq_len, transform=None, sample="intelligent"):
         self.dataset = dataset
         self.seq_len = seq_len
         self.transform = transform
+        self.sample = sample
         self.erase = RandomErasing3(probability=0.5)
 
     def __len__(self):
         return len(self.dataset)
 
+    def _intelligent_indices(self, num):
+        """
+        Split tracklet into seq_len segments; pick 1 random frame from each segment.
+        This matches the base repo behavior and increases temporal diversity.
+        """
+        indices = []
+        each = max(num // self.seq_len, 1)
+        for i in range(self.seq_len):
+            if i != self.seq_len - 1:
+                start = min(i * each, num - 1)
+                end = min((i + 1) * each - 1, num - 1)
+                indices.append(random.randint(start, end))
+            else:
+                start = min(i * each, num - 1)
+                indices.append(random.randint(start, num - 1))
+        return np.array(indices, dtype=int)
+
     def __getitem__(self, idx):
         img_paths, pid, camid = self.dataset[idx]
         num = len(img_paths)
 
-        indices = np.linspace(0, num - 1, self.seq_len).astype(int)
+        if self.sample == "intelligent":
+            indices = self._intelligent_indices(num)
+        else:
+            # fallback: evenly spaced (NOT recommended for training)
+            indices = np.linspace(0, num - 1, self.seq_len).astype(int)
 
         imgs = []
         erase_mask = []
@@ -196,7 +217,7 @@ class VideoDatasetTrain(Dataset):
             erase_mask.append(mask)
 
         imgs = torch.cat(imgs, dim=0)
-        erase_mask = torch.tensor(erase_mask)
+        erase_mask = torch.tensor(erase_mask, dtype=torch.float32)
 
         return imgs, pid, camid, erase_mask
 
@@ -240,5 +261,5 @@ class VideoDatasetTest(Dataset):
             if len(clips) >= self.max_length:
                 break
 
-        clips = torch.stack(clips)
+        clips = torch.stack(clips)  # [K, T, C, H, W]
         return clips, pid, camid, img_paths
