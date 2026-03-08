@@ -1,3 +1,5 @@
+# VID_Trans_ReID.py  (camera-agnostic + MetaBIN, PyTorch>=2.0, EMA-safe)
+
 import argparse
 import random
 from pathlib import Path
@@ -21,7 +23,6 @@ def set_seed(seed: int = 1234):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    # keep your setting
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -75,16 +76,23 @@ def evaluate(distmat: np.ndarray,
 # -------------------- Feature Extraction --------------------
 @torch.inference_mode()
 def extract_features(model, loader, device: torch.device):
+    """
+    Supports:
+      - imgs [B, T, C, H, W]
+      - imgs [B, K, T, C, H, W] (K clips per tracklet, usually during eval)
+    Returns:
+      feats: torch.Tensor [N, D]
+      pids, camids: np.ndarray [N]
+    """
     model.eval()
     feats, pids, camids = [], [], []
 
     for imgs, pid, camid, _paths in loader:
         if imgs.dim() == 6:
-            # [B, K, T, C, H, W] -> [B*K, T, C, H, W]
             B, K, T, C, H, W = imgs.shape
-            imgs = imgs.view(B * K, T, C, H, W).to(device, non_blocking=True)
+            imgs = imgs.reshape(B * K, T, C, H, W).to(device, non_blocking=True)
             f = model(imgs).detach()          # [B*K, D]
-            f = f.view(B, K, -1).mean(dim=1)  # [B, D]
+            f = f.reshape(B, K, -1).mean(dim=1)  # [B, D]
         else:
             imgs = imgs.to(device, non_blocking=True)
             f = model(imgs).detach()          # [B, D]
@@ -96,7 +104,7 @@ def extract_features(model, loader, device: torch.device):
         pids.extend([int(x) for x in pid_list])
         camids.extend([int(x) for x in cam_list])
 
-    feats = torch.cat(feats, dim=0)  # [N, D]
+    feats = torch.cat(feats, dim=0)
     return feats, np.asarray(pids), np.asarray(camids)
 
 
@@ -105,11 +113,11 @@ def test(model, query_loader, gallery_loader, device: torch.device):
     qf, q_pids, q_camids = extract_features(model, query_loader, device)
     gf, g_pids, g_camids = extract_features(model, gallery_loader, device)
 
-    # ✅ Normalize features (standard ReID practice)
+    # Normalize features
     qf = F.normalize(qf, dim=1)
     gf = F.normalize(gf, dim=1)
 
-    # ✅ Cosine distance (1 - cosine similarity)
+    # Cosine distance
     distmat = (1.0 - torch.mm(qf, gf.t())).numpy()
 
     cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids)
@@ -132,7 +140,7 @@ def save_checkpoint(path: Path, model, epoch: int, best_r1: float, args, ema=Non
 
 # -------------------- Main Training --------------------
 def main():
-    parser = argparse.ArgumentParser("VID-Trans-ReID (camera-agnostic + BIN/MetaBIN)")
+    parser = argparse.ArgumentParser("VID-Trans-ReID (camera-agnostic + MetaBIN)")
     parser.add_argument("--Dataset_name", required=True, choices=["Mars", "iLIDSVID", "PRID"])
     parser.add_argument("--pretrain_path", required=True)
     parser.add_argument("--output_dir", default="./outputs")
@@ -186,7 +194,9 @@ def main():
     # optimizers
     optimizer_center = torch.optim.SGD(center_criterion.parameters(), lr=args.center_lr)
     optimizer = build_optimizer(model)
-    scheduler = build_scheduler(optimizer)
+
+    # ✅ IMPORTANT: scheduler must follow args.epochs
+    scheduler = build_scheduler(optimizer, num_epochs=args.epochs)
 
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
@@ -242,10 +252,10 @@ def main():
 
             optimizer_center.step()
 
-            # ✅ EMA update
+            # ✅ EMA update after optimizer step
             ema.update()
 
-            # accuracy
+            # accuracy (use global head only)
             pred = scores[0].argmax(dim=1) if isinstance(scores, list) else scores.argmax(dim=1)
             acc = (pred == pid).float().mean()
 
@@ -266,10 +276,12 @@ def main():
         print(f"[OK] Saved checkpoint: {latest_path}")
         print(f"[OK] Saved checkpoint: {last_path}")
 
-        # evaluation (use EMA weights!)
+        # evaluation (✅ evaluate EMA weights safely)
         if args.do_eval and (epoch % args.eval_every == 0):
-            with ema.average_parameters():
-                r1, mAP = test(model, query_loader, gallery_loader, device)
+            ema.store()
+            ema.copy_to()
+            r1, mAP = test(model, query_loader, gallery_loader, device)
+            ema.restore()
 
             print(f"[Eval @ epoch {epoch}] Rank-1: {r1:.4f} mAP: {mAP:.4f}")
             if r1 > best_r1:
