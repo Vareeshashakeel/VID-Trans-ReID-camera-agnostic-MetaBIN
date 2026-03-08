@@ -91,8 +91,15 @@ class AverageMeter(object):
 
 
 class RandomErasing3(object):
-    """Randomly selects a rectangle region in an image and erases its pixels.
-       Zhong et al. "Random Erasing Data Augmentation"
+    """ Randomly selects a rectangle region in an image and erases its pixels.
+        'Random Erasing Data Augmentation' by Zhong et al.
+        See https://arxiv.org/pdf/1708.04896.pdf
+    Args:
+         probability: The probability that the Random Erasing operation will be performed.
+         sl: Minimum proportion of erased area against input image.
+         sh: Maximum proportion of erased area against input image.
+         r1: Minimum aspect ratio of erased area.
+         mean: Erasing value.
     """
 
     def __init__(self, probability=0.5, sl=0.02, sh=0.4, r1=0.3,
@@ -104,13 +111,13 @@ class RandomErasing3(object):
         self.r1 = r1
 
     def __call__(self, img):
-        # img is a Tensor [C,H,W]
+        # img is Tensor [C,H,W]
         if random.uniform(0, 1) >= self.probability:
             return img, 0
 
         area = img.size(1) * img.size(2)
 
-        for _ in range(100):
+        for attempt in range(100):
             target_area = random.uniform(self.sl, self.sh) * area
             aspect_ratio = random.uniform(self.r1, 1 / self.r1)
 
@@ -130,17 +137,19 @@ class RandomErasing3(object):
 
                 return img, 1
 
-        # if we fail to find a valid region after 100 tries:
+        # if failed after 100 tries
         return img, 0
 
 
 def scheduler(optimizer, num_epochs: int = 120):
     """
-    Cosine schedule used by your repo.
-    Keep default num_epochs=120 for HPC training.
+    Cosine LR schedule.
+    Default num_epochs=120 (your HPC case).
+    You can pass args.epochs from training script if you want.
     """
     lr_min = 0.002 * 0.008
     warmup_lr_init = 0.01 * 0.008
+
     warmup_t = 5
     noise_range = None
 
@@ -168,20 +177,20 @@ def optimizer(model):
     for key, value in model.named_parameters():
         if not value.requires_grad:
             continue
-
         lr = 0.008
         weight_decay = 1e-4
         if "bias" in key:
             lr = 0.008 * 2
+            weight_decay = 1e-4
 
         params += [{"params": [value], "lr": lr, "weight_decay": weight_decay}]
 
-    opt = torch.optim.SGD(params, momentum=0.9)
-    return opt
+    optimizer = getattr(torch.optim, 'SGD')(params, momentum=0.9)
+    return optimizer
 
 
 class Scheduler:
-    """Parameter Scheduler Base Class"""
+    """ Parameter Scheduler Base Class """
 
     def __init__(self,
                  optimizer: torch.optim.Optimizer,
@@ -195,7 +204,6 @@ class Scheduler:
         self.optimizer = optimizer
         self.param_group_field = param_group_field
         self._initial_param_group_field = f"initial_{param_group_field}"
-
         if initialize:
             for i, group in enumerate(self.optimizer.param_groups):
                 if param_group_field not in group:
@@ -205,7 +213,6 @@ class Scheduler:
             for i, group in enumerate(self.optimizer.param_groups):
                 if self._initial_param_group_field not in group:
                     raise KeyError(f"{self._initial_param_group_field} missing from param_groups[{i}]")
-
         self.base_values = [group[self._initial_param_group_field] for group in self.optimizer.param_groups]
         self.metric = None
         self.noise_range_t = noise_range_t
@@ -331,13 +338,11 @@ class CosineLRScheduler(Scheduler):
 
             if self.cycle_limit == 0 or (self.cycle_limit > 0 and i < self.cycle_limit):
                 lrs = [
-                    lr_min + 0.5 * (lr_max - lr_min) *
-                    (1 + math.cos(math.pi * t_curr / t_i))
+                    lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * t_curr / t_i))
                     for lr_max in lr_max_values
                 ]
             else:
                 lrs = [self.lr_min for _ in self.base_values]
-
         return lrs
 
     def get_epoch_values(self, epoch: int):
