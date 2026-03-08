@@ -1,12 +1,12 @@
-# VID_Trans_ReID.py  (camera-agnostic, stable, PyTorch>=2.0 compatible)
-
 import argparse
 import random
 from pathlib import Path
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch import amp
+from torch_ema import ExponentialMovingAverage
 
 from Dataloader import dataloader
 from VID_Trans_model import VID_Trans
@@ -21,6 +21,7 @@ def set_seed(seed: int = 1234):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # keep your setting
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
@@ -74,52 +75,24 @@ def evaluate(distmat: np.ndarray,
 # -------------------- Feature Extraction --------------------
 @torch.inference_mode()
 def extract_features(model, loader, device: torch.device):
-    """
-    Handles both:
-      - 5D: [B, T, C, H, W]
-      - 6D: [B, K, T, C, H, W] (K clips per tracklet)
-    Returns:
-      feats: torch.Tensor [N, D]
-      pids, camids: np.ndarray [N]
-    """
     model.eval()
     feats, pids, camids = [], [], []
 
     for imgs, pid, camid, _paths in loader:
-        # Move to device + correct shape
         if imgs.dim() == 6:
             # [B, K, T, C, H, W] -> [B*K, T, C, H, W]
             B, K, T, C, H, W = imgs.shape
             imgs = imgs.view(B * K, T, C, H, W).to(device, non_blocking=True)
-
             f = model(imgs).detach()          # [B*K, D]
             f = f.view(B, K, -1).mean(dim=1)  # [B, D]
         else:
-            # [B, T, C, H, W]
             imgs = imgs.to(device, non_blocking=True)
             f = model(imgs).detach()          # [B, D]
 
-        # Move to CPU for distance computation
-        f = f.cpu()
+        feats.append(f.cpu())
 
-        # Keep per-tracklet features (B is usually 1 in query/gallery loaders)
-        # If B>1, we append all of them.
-        if f.dim() == 1:
-            f = f.unsqueeze(0)
-
-        feats.append(f)
-
-        # pid/camid can be tensor; normalize to python ints per element
-        if torch.is_tensor(pid):
-            pid_list = pid.detach().cpu().tolist()
-        else:
-            pid_list = list(pid) if isinstance(pid, (list, tuple)) else [int(pid)]
-
-        if torch.is_tensor(camid):
-            cam_list = camid.detach().cpu().tolist()
-        else:
-            cam_list = list(camid) if isinstance(camid, (list, tuple)) else [int(camid)]
-
+        pid_list = pid.detach().cpu().tolist() if torch.is_tensor(pid) else list(pid)
+        cam_list = camid.detach().cpu().tolist() if torch.is_tensor(camid) else list(camid)
         pids.extend([int(x) for x in pid_list])
         camids.extend([int(x) for x in cam_list])
 
@@ -132,35 +105,39 @@ def test(model, query_loader, gallery_loader, device: torch.device):
     qf, q_pids, q_camids = extract_features(model, query_loader, device)
     gf, g_pids, g_camids = extract_features(model, gallery_loader, device)
 
-    # Euclidean distance matrix
-    distmat = torch.cdist(qf, gf, p=2).numpy()
+    # ✅ Normalize features (standard ReID practice)
+    qf = F.normalize(qf, dim=1)
+    gf = F.normalize(gf, dim=1)
+
+    # ✅ Cosine distance (1 - cosine similarity)
+    distmat = (1.0 - torch.mm(qf, gf.t())).numpy()
 
     cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids)
     return float(cmc[0]), float(mAP)
 
 
 # -------------------- Checkpoint --------------------
-def save_checkpoint(path: Path, model, epoch: int, best_r1: float, args):
+def save_checkpoint(path: Path, model, epoch: int, best_r1: float, args, ema=None):
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "epoch": epoch,
-            "best_r1": best_r1,
-            "args": vars(args),
-        },
-        str(path),
-    )
+    payload = {
+        "model": model.state_dict(),
+        "epoch": epoch,
+        "best_r1": best_r1,
+        "args": vars(args),
+    }
+    if ema is not None:
+        payload["ema"] = ema.state_dict()
+    torch.save(payload, str(path))
 
 
 # -------------------- Main Training --------------------
 def main():
-    parser = argparse.ArgumentParser("VID-Trans-ReID (camera-agnostic, stable, PyTorch2 AMP OK)")
+    parser = argparse.ArgumentParser("VID-Trans-ReID (camera-agnostic + BIN/MetaBIN)")
     parser.add_argument("--Dataset_name", required=True, choices=["Mars", "iLIDSVID", "PRID"])
     parser.add_argument("--pretrain_path", required=True)
     parser.add_argument("--output_dir", default="./outputs")
-    parser.add_argument("--epochs", type=int, default=60)
-    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--seq_len", type=int, default=4)
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--seed", type=int, default=1234)
@@ -172,6 +149,9 @@ def main():
     parser.add_argument("--center_w", type=float, default=0.0005)
     parser.add_argument("--center_lr", type=float, default=0.05)
     parser.add_argument("--clip_grad", type=float, default=1.0)
+
+    # EMA
+    parser.add_argument("--ema_decay", type=float, default=0.995)
 
     args = parser.parse_args()
 
@@ -190,13 +170,14 @@ def main():
     )
 
     # model
-    # Keep args names exactly as your VID_Trans expects:
-    # In your previous working run you used: VID_Trans(num_classes=..., camera_num=..., pretrainpath=...)
     model = VID_Trans(
         num_classes=num_classes,
-        camera_num=camera_num,
+        camera_num=camera_num,           # passed but NOT used (camera-agnostic)
         pretrainpath=args.pretrain_path
     ).to(device)
+
+    # EMA wrapper
+    ema = ExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
 
     # losses
     loss_fun, center_criterion = make_loss(num_classes=num_classes)
@@ -207,7 +188,6 @@ def main():
     optimizer = build_optimizer(model)
     scheduler = build_scheduler(optimizer)
 
-    # AMP scaler (PyTorch2 compatible)
     scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
     loss_meter, acc_meter = AverageMeter(), AverageMeter()
@@ -220,7 +200,7 @@ def main():
     for epoch in range(1, args.epochs + 1):
         model.train()
 
-        # scheduler step (robust)
+        # scheduler step
         if hasattr(scheduler, "step"):
             try:
                 scheduler.step(epoch)
@@ -238,17 +218,11 @@ def main():
             optimizer.zero_grad(set_to_none=True)
             optimizer_center.zero_grad(set_to_none=True)
 
-            # ✅ FIX: PyTorch>=2.0 requires device_type
             with amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
-                # Your model signature (from your working logs): model(img, pid)
                 scores, feats, a_vals = model(img, pid)
-
                 loss_id, center = loss_fun(scores, feats, pid)
 
-                # attention loss (bounded, stable)
-                # If shapes broadcast, this is fine; otherwise adjust in your model output.
                 attn_loss = (a_vals * erase_mask).sum(dim=1).mean() if a_vals.dim() >= 2 else (a_vals * erase_mask).mean()
-
                 loss = loss_id + args.center_w * center + args.attn_w * attn_loss
 
             if not torch.isfinite(loss):
@@ -259,7 +233,6 @@ def main():
 
             scaler.scale(loss).backward()
 
-            # gradient clipping (after unscale)
             if args.clip_grad and args.clip_grad > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -267,14 +240,13 @@ def main():
             scaler.step(optimizer)
             scaler.update()
 
-            # center step (no grad-mult hack; already weighted by center_w)
             optimizer_center.step()
 
+            # ✅ EMA update
+            ema.update()
+
             # accuracy
-            if isinstance(scores, list):
-                pred = scores[0].argmax(dim=1)
-            else:
-                pred = scores.argmax(dim=1)
+            pred = scores[0].argmax(dim=1) if isinstance(scores, list) else scores.argmax(dim=1)
             acc = (pred == pid).float().mean()
 
             loss_meter.update(float(loss.detach().item()), img.size(0))
@@ -289,18 +261,20 @@ def main():
                 )
 
         # checkpoints
-        save_checkpoint(latest_path, model, epoch, best_r1, args)
-        save_checkpoint(last_path, model, epoch, best_r1, args)
+        save_checkpoint(latest_path, model, epoch, best_r1, args, ema=ema)
+        save_checkpoint(last_path, model, epoch, best_r1, args, ema=ema)
         print(f"[OK] Saved checkpoint: {latest_path}")
         print(f"[OK] Saved checkpoint: {last_path}")
 
-        # evaluation
+        # evaluation (use EMA weights!)
         if args.do_eval and (epoch % args.eval_every == 0):
-            r1, mAP = test(model, query_loader, gallery_loader, device)
+            with ema.average_parameters():
+                r1, mAP = test(model, query_loader, gallery_loader, device)
+
             print(f"[Eval @ epoch {epoch}] Rank-1: {r1:.4f} mAP: {mAP:.4f}")
             if r1 > best_r1:
                 best_r1 = r1
-                save_checkpoint(best_path, model, epoch, best_r1, args)
+                save_checkpoint(best_path, model, epoch, best_r1, args, ema=ema)
                 print(f"[OK] Saved BEST checkpoint: {best_path} (Rank-1={best_r1:.4f})")
 
     print("Training finished.")
