@@ -57,10 +57,10 @@ def weights_init_classifier(m):
 
 
 class MetaBIN1d(nn.Module):
-    """Meta Batch-Instance Normalization for 1D feature vectors.
+    """
+    Meta Batch-Instance Normalization for 1D feature vectors.
     Input/Output: [B, D]
     """
-
     def __init__(self, dim: int, eps: float = 1e-5, affine: bool = True):
         super().__init__()
         self.dim = dim
@@ -177,7 +177,7 @@ class VID_Trans(nn.Module):
     def forward(self, x, label=None, cam_label=None, view_label=None):
         """
         Train input: x [B,T,C,H,W]
-        Test input: x [B,T,C,H,W]  (B could be num_clips in your test script)
+        Test input:  x [B,T,C,H,W]  (B could be num_clips in your test script)
         """
         if x.dim() != 5:
             raise RuntimeError(f"Expected 5D input [B,T,C,H,W], got {x.dim()}D: {tuple(x.shape)}")
@@ -210,7 +210,7 @@ class VID_Trans(nn.Module):
         frame_feats = global_token.reshape(b, t, self.in_planes)  # [B,T,768]
         global_feat = (frame_feats * a_w.unsqueeze(-1)).sum(dim=1)  # [B,768]
 
-        feat_bn = self.bottleneck(global_feat)  # for classification
+        feat_bn = self.bottleneck(global_feat)  # for classification only
 
         # -------------------------
         # Local parts (patch stream)
@@ -243,18 +243,15 @@ class VID_Trans(nn.Module):
             Local_ID3 = self.classifier_3(part3_bn)
             Local_ID4 = self.classifier_4(part4_bn)
 
-            # metric losses should see raw features (more standard)
-            feat_list = [
-                F.normalize(global_feat, p=2, dim=1),
-                F.normalize(part1_f, p=2, dim=1),
-                F.normalize(part2_f, p=2, dim=1),
-                F.normalize(part3_f, p=2, dim=1),
-                F.normalize(part4_f, p=2, dim=1),
-            ]
+            # ✅ IMPORTANT FIX:
+            # Return RAW features for metric losses.
+            # Triplet will normalize inside Loss_fun.py; Center will use raw.
+            feat_list = [global_feat, part1_f, part2_f, part3_f, part4_f]
+
             return [Global_ID, Local_ID1, Local_ID2, Local_ID3, Local_ID4], feat_list, a_vals
 
         else:
-            # test embedding: concat BN features + normalize (important!)
+            # test embedding: concat BN features + normalize (ok)
             emb = torch.cat([feat_bn, part1_bn / 4, part2_bn / 4, part3_bn / 4, part4_bn / 4], dim=1)
             emb = F.normalize(emb, p=2, dim=1)
             return emb
