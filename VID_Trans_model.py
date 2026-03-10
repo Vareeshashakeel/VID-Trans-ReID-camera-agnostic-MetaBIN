@@ -6,6 +6,23 @@ from functools import partial
 from torch.nn import functional as F
 
 
+class _GradReverse(torch.autograd.Function):
+    """Gradient Reversal Layer (GRL) for camera-adversarial training."""
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, lambd: float):
+        ctx.lambd = float(lambd)
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+
+def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
+    return _GradReverse.apply(x, lambd)
+
+
 def TCSS(features, shift, b, t):
     # features: [B*T, N, D]
     # reshape -> [B, N, T*D]
@@ -57,10 +74,10 @@ def weights_init_classifier(m):
 
 
 class MetaBIN1d(nn.Module):
-    """
-    Meta Batch-Instance Normalization for 1D feature vectors.
+    """Meta Batch-Instance Normalization for 1D feature vectors.
     Input/Output: [B, D]
     """
+
     def __init__(self, dim: int, eps: float = 1e-5, affine: bool = True):
         super().__init__()
         self.dim = dim
@@ -102,6 +119,10 @@ class VID_Trans(nn.Module):
         super().__init__()
         self.in_planes = 768
         self.num_classes = num_classes
+        self.camera_num = camera_num
+
+        # GRL strength (set by training loop)
+        self._grl_lambda = 0.0
 
         # backbone
         self.base = TransReID(
@@ -134,6 +155,13 @@ class VID_Trans(nn.Module):
 
         self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
         self.classifier.apply(weights_init_classifier)
+
+        # Camera-adversarial head (optional)
+        if self.camera_num is not None and int(self.camera_num) > 0:
+            self.cam_classifier = nn.Linear(self.in_planes, int(self.camera_num))
+            self.cam_classifier.apply(weights_init_classifier)
+        else:
+            self.cam_classifier = None
 
         # local stream
         dpr = [x.item() for x in torch.linspace(0, 0, 12)]
@@ -177,7 +205,7 @@ class VID_Trans(nn.Module):
     def forward(self, x, label=None, cam_label=None, view_label=None):
         """
         Train input: x [B,T,C,H,W]
-        Test input:  x [B,T,C,H,W]  (B could be num_clips in your test script)
+        Test input: x [B,T,C,H,W]  (B could be num_clips)
         """
         if x.dim() != 5:
             raise RuntimeError(f"Expected 5D input [B,T,C,H,W], got {x.dim()}D: {tuple(x.shape)}")
@@ -212,6 +240,11 @@ class VID_Trans(nn.Module):
 
         feat_bn = self.bottleneck(global_feat)  # for classification only
 
+        # Camera-adversarial logits (only in training)
+        cam_logits = None
+        if self.training and (self.cam_classifier is not None):
+            cam_logits = self.cam_classifier(grad_reverse(global_feat, self._grl_lambda))
+
         # -------------------------
         # Local parts (patch stream)
         # -------------------------
@@ -243,18 +276,21 @@ class VID_Trans(nn.Module):
             Local_ID3 = self.classifier_3(part3_bn)
             Local_ID4 = self.classifier_4(part4_bn)
 
-            # ✅ IMPORTANT FIX:
-            # Return RAW features for metric losses.
-            # Triplet will normalize inside Loss_fun.py; Center will use raw.
+            # metric losses see raw features (Loss_fun normalizes triplet internally)
             feat_list = [global_feat, part1_f, part2_f, part3_f, part4_f]
 
-            return [Global_ID, Local_ID1, Local_ID2, Local_ID3, Local_ID4], feat_list, a_vals
+            # return cam_logits as 4th output
+            return [Global_ID, Local_ID1, Local_ID2, Local_ID3, Local_ID4], feat_list, a_vals, cam_logits
 
         else:
-            # test embedding: concat BN features + normalize (ok)
+            # test embedding: concat BN features + normalize
             emb = torch.cat([feat_bn, part1_bn / 4, part2_bn / 4, part3_bn / 4, part4_bn / 4], dim=1)
             emb = F.normalize(emb, p=2, dim=1)
             return emb
+
+    def set_grl_lambda(self, lambd: float) -> None:
+        """Set GRL lambda (strength of gradient reversal) from training loop."""
+        self._grl_lambda = float(lambd)
 
     def load_param(self, trained_path, load=False):
         if not load:
