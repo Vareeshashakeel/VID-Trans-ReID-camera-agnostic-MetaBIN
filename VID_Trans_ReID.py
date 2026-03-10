@@ -1,306 +1,291 @@
+import argparse
+import random
+from pathlib import Path
+
+import numpy as np
 import torch
-import torch.nn as nn
-import copy
-from vit_ID import TransReID, Block
-from functools import partial
-from torch.nn import functional as F
+import torch.nn.functional as F
+from torch import amp
+from torch_ema import ExponentialMovingAverage
+
+from Dataloader import dataloader
+from VID_Trans_model import VID_Trans
+from Loss_fun import make_loss
+from utility import AverageMeter, optimizer as build_optimizer, scheduler as build_scheduler
 
 
-class _GradReverse(torch.autograd.Function):
-    """Gradient Reversal Layer (GRL) for camera-adversarial training."""
-
-    @staticmethod
-    def forward(ctx, x: torch.Tensor, lambd: float):
-        ctx.lambd = float(lambd)
-        return x.view_as(x)
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        return -ctx.lambd * grad_output, None
+# -------------------- Reproducibility --------------------
+def set_seed(seed: int = 1234):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-def grad_reverse(x: torch.Tensor, lambd: float = 1.0) -> torch.Tensor:
-    return _GradReverse.apply(x, lambd)
+# -------------------- Evaluation --------------------
+def evaluate(distmat: np.ndarray,
+             q_pids: np.ndarray,
+             g_pids: np.ndarray,
+             q_camids: np.ndarray,
+             g_camids: np.ndarray,
+             max_rank: int = 21):
+    num_q, num_g = distmat.shape
+    max_rank = min(max_rank, num_g)
+
+    indices = np.argsort(distmat, axis=1)
+    matches = (g_pids[indices] == q_pids[:, None]).astype(np.int32)
+
+    all_cmc, all_AP = [], []
+    num_valid_q = 0
+
+    for q_idx in range(num_q):
+        q_pid = q_pids[q_idx]
+        q_camid = q_camids[q_idx]
+
+        order = indices[q_idx]
+        remove = (g_pids[order] == q_pid) & (g_camids[order] == q_camid)
+        keep = ~remove
+
+        orig_cmc = matches[q_idx][keep]
+        if not np.any(orig_cmc):
+            continue
+
+        cmc = orig_cmc.cumsum()
+        cmc[cmc > 1] = 1
+        all_cmc.append(cmc[:max_rank])
+        num_valid_q += 1
+
+        num_rel = orig_cmc.sum()
+        tmp_cmc = orig_cmc.cumsum()
+        tmp_cmc = np.asarray([x / (i + 1.0) for i, x in enumerate(tmp_cmc)]) * orig_cmc
+        all_AP.append(tmp_cmc.sum() / num_rel)
+
+    if num_valid_q == 0:
+        raise RuntimeError("No valid queries for evaluation (all query IDs missing in gallery).")
+
+    all_cmc = np.asarray(all_cmc, dtype=np.float32).sum(0) / num_valid_q
+    mAP = float(np.mean(all_AP))
+    return all_cmc, mAP
 
 
-def TCSS(features, shift, b, t):
-    # features: [B*T, N, D]
-    # reshape -> [B, N, T*D]
-    features = features.reshape(b, features.size(1), t * features.size(2))
-    token = features[:, 0:1]  # [B,1, t*D]
+# -------------------- Feature Extraction --------------------
+@torch.inference_mode()
+def extract_features(model, loader, device: torch.device):
+    model.eval()
+    feats, pids, camids = [], [], []
 
-    # shift only patches (skip cls)
-    patches = features[:, 1:]  # [B, N-1, t*D]
-    patches = torch.cat([patches[:, shift:], patches[:, :shift]], dim=1)
-    features = torch.cat([token, patches], dim=1)
-
-    # Patch shuffling by 2-part (safe on odd length)
-    patches = features[:, 1:]
-    if patches.size(1) % 2 != 0:
-        patches = torch.cat([patches, patches[:, -1:, :]], dim=1)
-
-    batchsize = features.size(0)
-    dim = features.size(-1)
-
-    patches = patches.reshape(batchsize, 2, -1, dim)
-    patches = torch.transpose(patches, 1, 2).contiguous()
-    patches = patches.reshape(batchsize, -1, dim)
-
-    return patches, token
-
-
-def weights_init_kaiming(m):
-    classname = m.__class__.__name__
-    if classname.find('Linear') != -1:
-        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0.0)
-    elif classname.find('Conv') != -1:
-        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in')
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0.0)
-    elif classname.find('BatchNorm') != -1:
-        if getattr(m, "affine", False):
-            nn.init.constant_(m.weight, 1.0)
-            nn.init.constant_(m.bias, 0.0)
-
-
-def weights_init_classifier(m):
-    classname = m.__class__.__name__
-    if classname.find('Linear') != -1:
-        nn.init.normal_(m.weight, std=0.001)
-        if m.bias is not None:
-            nn.init.constant_(m.bias, 0.0)
-
-
-class MetaBIN1d(nn.Module):
-    """Meta Batch-Instance Normalization for 1D feature vectors.
-    Input/Output: [B, D]
-    """
-
-    def __init__(self, dim: int, eps: float = 1e-5, affine: bool = True):
-        super().__init__()
-        self.dim = dim
-        self.eps = eps
-        self.bn = nn.BatchNorm1d(dim, affine=True)
-
-        # gate per dim
-        self.alpha = nn.Parameter(torch.zeros(dim))
-
-        if affine:
-            self.gamma = nn.Parameter(torch.ones(dim))
-            self.beta = nn.Parameter(torch.zeros(dim))
+    for imgs, pid, camid, _paths in loader:
+        if imgs.dim() == 6:
+            B, K, T, C, H, W = imgs.shape
+            imgs = imgs.view(B * K, T, C, H, W).to(device, non_blocking=True)
+            f = model(imgs).detach()
+            f = f.view(B, K, -1).mean(dim=1)
         else:
-            self.register_parameter('gamma', None)
-            self.register_parameter('beta', None)
+            imgs = imgs.to(device, non_blocking=True)
+            f = model(imgs).detach()
 
-    @staticmethod
-    def _instance_norm_vec(x: torch.Tensor, eps: float) -> torch.Tensor:
-        mean = x.mean(dim=1, keepdim=True)
-        var = x.var(dim=1, keepdim=True, unbiased=False)
-        return (x - mean) / torch.sqrt(var + eps)
+        feats.append(f.cpu())
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 2:
-            raise RuntimeError(f"MetaBIN1d expects 2D [B,D] input, got {tuple(x.shape)}")
+        pid_list = pid.detach().cpu().tolist() if torch.is_tensor(pid) else list(pid)
+        cam_list = camid.detach().cpu().tolist() if torch.is_tensor(camid) else list(camid)
+        pids.extend([int(x) for x in pid_list])
+        camids.extend([int(x) for x in cam_list])
 
-        x_bn = self.bn(x)
-        x_in = self._instance_norm_vec(x, self.eps)
-        gate = torch.sigmoid(self.alpha).unsqueeze(0)  # [1,D]
-
-        y = gate * x_bn + (1.0 - gate) * x_in
-        if self.gamma is not None:
-            y = y * self.gamma.unsqueeze(0) + self.beta.unsqueeze(0)
-        return y
+    feats = torch.cat(feats, dim=0)
+    return feats, np.asarray(pids), np.asarray(camids)
 
 
-class VID_Trans(nn.Module):
-    def __init__(self, num_classes, camera_num=None, pretrainpath=None):
-        super().__init__()
-        self.in_planes = 768
-        self.num_classes = num_classes
-        self.camera_num = camera_num
+@torch.inference_mode()
+def test(model, query_loader, gallery_loader, device: torch.device):
+    qf, q_pids, q_camids = extract_features(model, query_loader, device)
+    gf, g_pids, g_camids = extract_features(model, gallery_loader, device)
 
-        # GRL strength (set by training loop)
-        self._grl_lambda = 0.0
+    qf = F.normalize(qf, dim=1)
+    gf = F.normalize(gf, dim=1)
 
-        # backbone
-        self.base = TransReID(
-            img_size=[256, 128],
-            patch_size=16,
-            stride_size=[16, 16],
-            embed_dim=768,
-            depth=12,
-            num_heads=12,
-            mlp_ratio=4,
-            qkv_bias=True,
-            drop_path_rate=0.1,
-            drop_rate=0.0,
-            attn_drop_rate=0.0,
-            norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        )
+    distmat = (1.0 - torch.mm(qf, gf.t())).numpy()
 
-        if pretrainpath is not None:
-            state_dict = torch.load(pretrainpath, map_location="cpu")
-            self.base.load_param(state_dict, load=True)
+    cmc, mAP = evaluate(distmat, q_pids, g_pids, q_camids, g_camids)
+    return float(cmc[0]), float(mAP)
 
-        # global stream: last block + norm
-        block = self.base.blocks[-1]
-        layer_norm = self.base.norm
-        self.b1 = nn.Sequential(copy.deepcopy(block), copy.deepcopy(layer_norm))
 
-        # MetaBIN necks
-        self.bottleneck = MetaBIN1d(self.in_planes)
-        self.bottleneck.apply(weights_init_kaiming)
+# -------------------- Checkpoint --------------------
+def save_checkpoint(path: Path, model, epoch: int, best_r1: float, args, ema=None):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model": model.state_dict(),
+        "epoch": epoch,
+        "best_r1": best_r1,
+        "args": vars(args),
+    }
+    if ema is not None:
+        payload["ema"] = ema.state_dict()
+    torch.save(payload, str(path))
 
-        self.classifier = nn.Linear(self.in_planes, self.num_classes, bias=False)
-        self.classifier.apply(weights_init_classifier)
 
-        # Camera-adversarial head (optional)
-        if self.camera_num is not None and int(self.camera_num) > 0:
-            self.cam_classifier = nn.Linear(self.in_planes, int(self.camera_num))
-            self.cam_classifier.apply(weights_init_classifier)
-        else:
-            self.cam_classifier = None
+# -------------------- Main Training --------------------
+def main():
+    parser = argparse.ArgumentParser("VID-Trans-ReID (camera-agnostic + MetaBIN + Cam-Adv)")
+    parser.add_argument("--Dataset_name", required=True, choices=["Mars", "iLIDSVID", "PRID"])
+    parser.add_argument("--pretrain_path", required=True)
+    parser.add_argument("--output_dir", default="./outputs")
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--seq_len", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--eval_every", type=int, default=10)
+    parser.add_argument("--do_eval", action="store_true")
 
-        # local stream
-        dpr = [x.item() for x in torch.linspace(0, 0, 12)]
-        self.block1 = Block(
-            dim=3072,
-            num_heads=12,
-            mlp_ratio=4,
-            qkv_bias=True,
-            qk_scale=None,
-            drop=0,
-            attn_drop=0,
-            drop_path=dpr[11],
-            norm_layer=partial(nn.LayerNorm, eps=1e-6),
-        )
-        self.b2 = nn.Sequential(self.block1, nn.LayerNorm(3072))
+    parser.add_argument("--attn_w", type=float, default=0.1)
+    parser.add_argument("--center_w", type=float, default=0.0005)
+    parser.add_argument("--center_lr", type=float, default=0.05)
+    parser.add_argument("--clip_grad", type=float, default=1.0)
 
-        self.bottleneck_1 = MetaBIN1d(3072); self.bottleneck_1.apply(weights_init_kaiming)
-        self.bottleneck_2 = MetaBIN1d(3072); self.bottleneck_2.apply(weights_init_kaiming)
-        self.bottleneck_3 = MetaBIN1d(3072); self.bottleneck_3.apply(weights_init_kaiming)
-        self.bottleneck_4 = MetaBIN1d(3072); self.bottleneck_4.apply(weights_init_kaiming)
+    parser.add_argument("--ema_decay", type=float, default=0.995)
 
-        self.classifier_1 = nn.Linear(3072, self.num_classes, bias=False); self.classifier_1.apply(weights_init_classifier)
-        self.classifier_2 = nn.Linear(3072, self.num_classes, bias=False); self.classifier_2.apply(weights_init_classifier)
-        self.classifier_3 = nn.Linear(3072, self.num_classes, bias=False); self.classifier_3.apply(weights_init_classifier)
-        self.classifier_4 = nn.Linear(3072, self.num_classes, bias=False); self.classifier_4.apply(weights_init_classifier)
+    # Camera-adversarial training weight (0 disables)
+    parser.add_argument("--cam_adv_w", type=float, default=0.15)
 
-        # video attention
-        self.middle_dim = 256
-        self.attention_conv = nn.Conv2d(self.in_planes, self.middle_dim, kernel_size=1, stride=1)
-        self.attention_tconv = nn.Conv1d(self.middle_dim, 1, kernel_size=3, padding=1)
-        self.attention_conv.apply(weights_init_kaiming)
-        self.attention_tconv.apply(weights_init_kaiming)
+    args = parser.parse_args()
 
-        self.shift_num = 5
-        self.part = 4
+    set_seed(args.seed)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # stability knobs
-        self.attn_logit_clip = 10.0
-        self.attn_val_clip = 10.0
+    outdir = Path(args.output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-    def forward(self, x, label=None, cam_label=None, view_label=None):
-        """
-        Train input: x [B,T,C,H,W]
-        Test input: x [B,T,C,H,W]  (B could be num_clips)
-        """
-        if x.dim() != 5:
-            raise RuntimeError(f"Expected 5D input [B,T,C,H,W], got {x.dim()}D: {tuple(x.shape)}")
+    train_loader, _num_query, num_classes, camera_num, _view_num, query_loader, gallery_loader = dataloader(
+        args.Dataset_name,
+        batch_size=args.batch_size,
+        seq_len=args.seq_len,
+        num_workers=args.num_workers,
+    )
 
-        b = x.size(0)
-        t = x.size(1)
+    model = VID_Trans(
+        num_classes=num_classes,
+        camera_num=camera_num,
+        pretrainpath=args.pretrain_path
+    ).to(device)
 
-        # flatten frames -> [B*T,C,H,W]
-        x = x.reshape(b * t, x.size(2), x.size(3), x.size(4))
+    ema = ExponentialMovingAverage(model.parameters(), decay=args.ema_decay)
 
-        # backbone -> [B*T, N, 768]
-        features = self.base(x)
+    loss_fun, center_criterion = make_loss(num_classes=num_classes)
+    center_criterion = center_criterion.to(device)
 
-        # -------------------------
-        # Global branch
-        # -------------------------
-        b1_feat = self.b1(features)
-        global_token = b1_feat[:, 0]  # [B*T,768]
+    optimizer_center = torch.optim.SGD(center_criterion.parameters(), lr=args.center_lr)
+    optimizer = build_optimizer(model)
+    scheduler = build_scheduler(optimizer, num_epochs=args.epochs)
 
-        # attention over time
-        g = global_token.unsqueeze(-1).unsqueeze(-1)  # [B*T,768,1,1]
-        a = F.relu(self.attention_conv(g))            # [B*T,256,1,1]
-        a = a.reshape(b, t, self.middle_dim).permute(0, 2, 1).contiguous()  # [B,256,T]
-        a = F.relu(self.attention_tconv(a)).squeeze(1)  # [B,T]
+    scaler = amp.GradScaler(enabled=(device.type == "cuda"))
 
-        a_vals = torch.clamp(a, 0.0, self.attn_val_clip)
-        a_logits = torch.clamp(a, 0.0, self.attn_logit_clip)
-        a_w = F.softmax(a_logits, dim=1)  # [B,T]
+    loss_meter, acc_meter = AverageMeter(), AverageMeter()
 
-        frame_feats = global_token.reshape(b, t, self.in_planes)  # [B,T,768]
-        global_feat = (frame_feats * a_w.unsqueeze(-1)).sum(dim=1)  # [B,768]
+    best_r1 = -1.0
+    best_path = outdir / f"{args.Dataset_name}_camera_agnostic_best.pth"
+    latest_path = outdir / "latest.pth"
+    last_path = outdir / "last_epoch.pth"
 
-        feat_bn = self.bottleneck(global_feat)  # for classification only
+    for epoch in range(1, args.epochs + 1):
+        model.train()
 
-        # Camera-adversarial logits (only in training)
-        cam_logits = None
-        if self.training and (self.cam_classifier is not None):
-            cam_logits = self.cam_classifier(grad_reverse(global_feat, self._grl_lambda))
+        if hasattr(scheduler, "step"):
+            try:
+                scheduler.step(epoch)
+            except TypeError:
+                scheduler.step()
 
-        # -------------------------
-        # Local parts (patch stream)
-        # -------------------------
-        feature_length = features.size(1) - 1
-        patch_length = feature_length // 4
+        loss_meter.reset()
+        acc_meter.reset()
 
-        patches, token = TCSS(features, self.shift_num, b, t)
+        for it, (img, pid, camid, erase_mask) in enumerate(train_loader, start=1):
+            img = img.to(device, non_blocking=True)
+            pid = pid.to(device, non_blocking=True)
+            camid = camid.to(device, non_blocking=True)
+            erase_mask = erase_mask.to(device, non_blocking=True).float()
 
-        p1 = patches[:, :patch_length]
-        p2 = patches[:, patch_length:patch_length * 2]
-        p3 = patches[:, patch_length * 2:patch_length * 3]
-        p4 = patches[:, patch_length * 3:patch_length * 4]
+            optimizer.zero_grad(set_to_none=True)
+            optimizer_center.zero_grad(set_to_none=True)
 
-        part1 = self.b2(torch.cat((token, p1), dim=1)); part1_f = part1[:, 0]
-        part2 = self.b2(torch.cat((token, p2), dim=1)); part2_f = part2[:, 0]
-        part3 = self.b2(torch.cat((token, p3), dim=1)); part3_f = part3[:, 0]
-        part4 = self.b2(torch.cat((token, p4), dim=1)); part4_f = part4[:, 0]
+            # DANN schedule for GRL lambda
+            if hasattr(model, "set_grl_lambda"):
+                p = (epoch - 1 + it / max(1, len(train_loader))) / max(1, args.epochs)
+                grl_lambda = float(2.0 / (1.0 + np.exp(-10 * p)) - 1.0)
+                model.set_grl_lambda(grl_lambda)
 
-        part1_bn = self.bottleneck_1(part1_f)
-        part2_bn = self.bottleneck_2(part2_f)
-        part3_bn = self.bottleneck_3(part3_f)
-        part4_bn = self.bottleneck_4(part4_f)
+            with amp.autocast(device_type=device.type, enabled=(device.type == "cuda")):
+                out = model(img, pid)
+                scores, feats, a_vals = out[0], out[1], out[2]
+                cam_logits = out[3] if len(out) > 3 else None
 
-        if self.training:
-            # classification uses BN/MetaBIN features
-            Global_ID = self.classifier(feat_bn)
-            Local_ID1 = self.classifier_1(part1_bn)
-            Local_ID2 = self.classifier_2(part2_bn)
-            Local_ID3 = self.classifier_3(part3_bn)
-            Local_ID4 = self.classifier_4(part4_bn)
+                loss_id, center = loss_fun(scores, feats, pid)
 
-            # metric losses see raw features (Loss_fun normalizes triplet internally)
-            feat_list = [global_feat, part1_f, part2_f, part3_f, part4_f]
+                attn_loss = (a_vals * erase_mask).sum(dim=1).mean() if a_vals.dim() >= 2 else (a_vals * erase_mask).mean()
 
-            # return cam_logits as 4th output
-            return [Global_ID, Local_ID1, Local_ID2, Local_ID3, Local_ID4], feat_list, a_vals, cam_logits
+                cam_loss = 0.0
+                if (cam_logits is not None) and (args.cam_adv_w > 0):
+                    cam_loss = F.cross_entropy(cam_logits, camid)
 
-        else:
-            # test embedding: concat BN features + normalize
-            emb = torch.cat([feat_bn, part1_bn / 4, part2_bn / 4, part3_bn / 4, part4_bn / 4], dim=1)
-            emb = F.normalize(emb, p=2, dim=1)
-            return emb
+                loss = loss_id + args.center_w * center + args.attn_w * attn_loss + args.cam_adv_w * cam_loss
 
-    def set_grl_lambda(self, lambd: float) -> None:
-        """Set GRL lambda (strength of gradient reversal) from training loop."""
-        self._grl_lambda = float(lambd)
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"NaN/Inf loss detected at epoch={epoch} iter={it} | "
+                    f"id={float(loss_id.detach()):.4f} center={float(center.detach()):.4f} "
+                    f"attn={float(attn_loss.detach()):.4f}"
+                )
 
-    def load_param(self, trained_path, load=False):
-        if not load:
-            param_dict = torch.load(trained_path)
-            for i in param_dict:
-                self.state_dict()[i.replace('module.', '')].copy_(param_dict[i])
-            print(f'Loading pretrained model from {trained_path}')
-        else:
-            param_dict = trained_path
-            for i in param_dict:
-                if i not in self.state_dict() or 'classifier' in i or 'sie_embed' in i:
-                    continue
-                self.state_dict()[i].copy_(param_dict[i])
+            scaler.scale(loss).backward()
+
+            if args.clip_grad and args.clip_grad > 0:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            optimizer_center.step()
+            ema.update()
+
+            pred = scores[0].argmax(dim=1) if isinstance(scores, list) else scores.argmax(dim=1)
+            acc = (pred == pid).float().mean()
+
+            loss_meter.update(float(loss.detach().item()), img.size(0))
+            acc_meter.update(float(acc.detach().item()), 1)
+
+            if it % 50 == 0:
+                lr = optimizer.param_groups[0]["lr"]
+                print(
+                    f"Epoch[{epoch}/{args.epochs}] Iter[{it}/{len(train_loader)}] "
+                    f"Loss: {loss_meter.avg:.4f} Acc: {acc_meter.avg:.4f} LR: {lr:.2e} | "
+                    f"id={float(loss_id.detach()):.3f} center={float(center.detach()):.3f} "
+                    f"attn={float(attn_loss.detach()):.3f} "
+                    f"cam={float(cam_loss.detach()) if torch.is_tensor(cam_loss) else float(cam_loss):.3f}"
+                )
+
+        save_checkpoint(latest_path, model, epoch, best_r1, args, ema=ema)
+        save_checkpoint(last_path, model, epoch, best_r1, args, ema=ema)
+        print(f"[OK] Saved checkpoint: {latest_path}")
+        print(f"[OK] Saved checkpoint: {last_path}")
+
+        if args.do_eval and (epoch % args.eval_every == 0):
+            with ema.average_parameters():
+                r1, mAP = test(model, query_loader, gallery_loader, device)
+
+            print(f"[Eval @ epoch {epoch}] Rank-1: {r1:.4f} mAP: {mAP:.4f}")
+            if r1 > best_r1:
+                best_r1 = r1
+                save_checkpoint(best_path, model, epoch, best_r1, args, ema=ema)
+                print(f"[OK] Saved BEST checkpoint: {best_path} (Rank-1={best_r1:.4f})")
+
+    print("Training finished.")
+    print(f"Best Rank-1: {best_r1:.4f}")
+    print(f"Latest checkpoint: {latest_path}")
+    print(f"Best checkpoint: {best_path}")
+
+
+if __name__ == "__main__":
+    main()
